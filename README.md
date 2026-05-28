@@ -45,6 +45,20 @@ statusboard --once       # print once and exit
 statusboard --refresh-interval 1800  # refresh every 30 minutes
 ```
 
+### Monitoring other users
+
+By default the dashboard tracks the currently authenticated user (`@me`). To
+watch other users instead, pass `--monitor-user` one or more times. When this
+flag is present, `@me` is no longer included in any search.
+
+```
+statusboard --monitor-user=alice
+statusboard --monitor-user=alice --monitor-user=bob
+```
+
+Pass `--monitor-user` once per user; comma-separated lists are not supported
+here. Results from each user are merged and deduplicated.
+
 ### Filtering
 
 Limit which orgs and repos appear. All four flags may be repeated, accept

@@ -15,13 +15,22 @@ struct Attend {
             includeRepos: multiValue(args: args, flag: "--include-repo"),
             excludeRepos: multiValue(args: args, flag: "--exclude-repo")
         )
-        let runner = PRDashboard(once: once, refreshInterval: refreshInterval, filter: filter)
+        let monitorUsers = rawMultiValue(args: args, flag: "--monitor-user")
+        let runner = PRDashboard(once: once, refreshInterval: refreshInterval, filter: filter, monitorUsers: monitorUsers)
         await runner.run()
     }
 
     /// Collect every occurrence of `--flag value` and `--flag=value`. Values may
     /// also be comma-separated (e.g. `--exclude-org=zadr,foo`).
     static func multiValue(args: [String], flag: String) -> [String] {
+        rawMultiValue(args: args, flag: flag)
+            .flatMap { $0.split(separator: ",").map { String($0).trimmingCharacters(in: .whitespaces) } }
+            .filter { !$0.isEmpty }
+    }
+
+    /// Like `multiValue`, but does not split values on commas. Use for flags
+    /// where the value is taken verbatim (e.g. `--monitor-user`).
+    static func rawMultiValue(args: [String], flag: String) -> [String] {
         var values: [String] = []
         var i = 0
         while i < args.count {
@@ -36,8 +45,9 @@ struct Attend {
                 i += 1
             }
         }
-        return values.flatMap { $0.split(separator: ",").map { String($0).trimmingCharacters(in: .whitespaces) } }
-                     .filter { !$0.isEmpty }
+        return values
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty }
     }
 
     static func singleValue(args: [String], flag: String) -> String? {
@@ -73,7 +83,7 @@ struct RepoFilter: Sendable {
     private static func glob(_ pattern: String, _ string: String) -> Bool {
         // NSPredicate LIKE supports `*` (any chars) and `?` (one char).
         // `[c]` is case-insensitive; GitHub orgs/repos are case-insensitive.
-        NSPredicate(format: "SELF LIKE[c] %@", pattern).evaluate(with: string)
+        pattern.withCString { pat in string.withCString { str in fnmatch(pat, str, FNM_CASEFOLD) == 0 } }
     }
 }
 
@@ -120,13 +130,21 @@ actor PRDashboard {
     let once: Bool
     let refreshInterval: Int
     let filter: RepoFilter
+    let monitorUsers: [String]
     private var lastPRs: [PullRequest]?
     private var lastReviews: [ReviewRequest]?
 
-    init(once: Bool = false, refreshInterval: Int = 900, filter: RepoFilter = RepoFilter(includeOrgs: [], excludeOrgs: [], includeRepos: [], excludeRepos: [])) {
+    init(once: Bool = false, refreshInterval: Int = 900, filter: RepoFilter = RepoFilter(includeOrgs: [], excludeOrgs: [], includeRepos: [], excludeRepos: []), monitorUsers: [String] = []) {
         self.once = once
         self.refreshInterval = refreshInterval
         self.filter = filter
+        self.monitorUsers = monitorUsers
+    }
+
+    /// Users to use in `author:` / `review-requested:` qualifiers. When
+    /// `--monitor-user` was not provided, fall back to `@me`.
+    private var queryUsers: [String] {
+        monitorUsers.isEmpty ? ["@me"] : monitorUsers
     }
 
     func run() async {
@@ -167,50 +185,70 @@ actor PRDashboard {
 
     private func fetchAllPRs() async -> [PullRequest]? {
         var allPRs: [PullRequest] = []
-        var cursor: String? = nil
+        var seen: Set<String> = []
+        var anySuccess = false
 
-        for _ in 0..<5 {
-            let afterClause = cursor.map { #", after: "\#($0)""# } ?? ""
-            let query = #"{ search(query: "is:pr is:open author:@me", type: ISSUE, first: 20\#(afterClause)) { pageInfo { hasNextPage endCursor } nodes { ... on PullRequest { \#(Self.prFields) } } } }"#
+        for user in queryUsers {
+            var cursor: String? = nil
 
-            guard let (prs, pageInfo) = await fetchPage(query: query) else {
-                return allPRs.isEmpty ? nil : allPRs
-            }
-            allPRs.append(contentsOf: prs)
+            while true {
+                let afterClause = cursor.map { #", after: "\#($0)""# } ?? ""
+                let query = #"{ search(query: "is:pr is:open author:\#(user)", type: ISSUE, first: 20\#(afterClause)) { pageInfo { hasNextPage endCursor } nodes { ... on PullRequest { \#(Self.prFields) } } } }"#
 
-            if let hasNext = pageInfo["hasNextPage"] as? Bool, hasNext,
-               let endCursor = pageInfo["endCursor"] as? String {
-                cursor = endCursor
-                try? await Task.sleep(for: .seconds(1))
-            } else {
-                break
+                guard let (prs, pageInfo) = await fetchPage(query: query) else { break }
+                anySuccess = true
+                for pr in prs {
+                    let key = "\(pr.repo)#\(pr.number)"
+                    if seen.insert(key).inserted {
+                        allPRs.append(pr)
+                    }
+                }
+
+                if let hasNext = pageInfo["hasNextPage"] as? Bool, hasNext,
+                   let endCursor = pageInfo["endCursor"] as? String {
+                    cursor = endCursor
+                    try? await Task.sleep(for: .seconds(1))
+                } else {
+                    break
+                }
             }
         }
-        return allPRs
+
+        return anySuccess ? allPRs : nil
     }
 
     private func fetchReviewRequests() async -> [ReviewRequest]? {
         var all: [ReviewRequest] = []
-        var cursor: String? = nil
+        var seen: Set<String> = []
+        var anySuccess = false
 
-        for _ in 0..<5 {
-            let afterClause = cursor.map { #", after: "\#($0)""# } ?? ""
-            let query = #"{ search(query: "is:pr is:open review-requested:@me", type: ISSUE, first: 20\#(afterClause)) { pageInfo { hasNextPage endCursor } nodes { ... on PullRequest { number title repository { nameWithOwner } author { login } } } } }"#
+        for user in queryUsers {
+            var cursor: String? = nil
 
-            guard let (reviews, pageInfo) = await fetchReviewPage(query: query) else {
-                return all.isEmpty ? nil : all
-            }
-            all.append(contentsOf: reviews)
+            while true {
+                let afterClause = cursor.map { #", after: "\#($0)""# } ?? ""
+                let query = #"{ search(query: "is:pr is:open review-requested:\#(user)", type: ISSUE, first: 20\#(afterClause)) { pageInfo { hasNextPage endCursor } nodes { ... on PullRequest { number title repository { nameWithOwner } author { login } } } } }"#
 
-            if let hasNext = pageInfo["hasNextPage"] as? Bool, hasNext,
-               let endCursor = pageInfo["endCursor"] as? String {
-                cursor = endCursor
-                try? await Task.sleep(for: .seconds(1))
-            } else {
-                break
+                guard let (reviews, pageInfo) = await fetchReviewPage(query: query) else { break }
+                anySuccess = true
+                for r in reviews {
+                    let key = "\(r.repo)#\(r.number)"
+                    if seen.insert(key).inserted {
+                        all.append(r)
+                    }
+                }
+
+                if let hasNext = pageInfo["hasNextPage"] as? Bool, hasNext,
+                   let endCursor = pageInfo["endCursor"] as? String {
+                    cursor = endCursor
+                    try? await Task.sleep(for: .seconds(1))
+                } else {
+                    break
+                }
             }
         }
-        return all
+
+        return anySuccess ? all : nil
     }
 
     private func ghPath() -> String {
