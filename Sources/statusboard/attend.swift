@@ -6,12 +6,74 @@ struct Attend {
         let args = CommandLine.arguments
         let once = args.contains("--once")
         var refreshInterval = 900
-        if let idx = args.firstIndex(of: "--refresh-interval"), idx + 1 < args.count,
-           let val = Int(args[idx + 1]), val > 0 {
+        if let val = singleValue(args: args, flag: "--refresh-interval").flatMap(Int.init), val > 0 {
             refreshInterval = val
         }
-        let runner = PRDashboard(once: once, refreshInterval: refreshInterval)
+        let filter = RepoFilter(
+            includeOrgs: multiValue(args: args, flag: "--include-org"),
+            excludeOrgs: multiValue(args: args, flag: "--exclude-org"),
+            includeRepos: multiValue(args: args, flag: "--include-repo"),
+            excludeRepos: multiValue(args: args, flag: "--exclude-repo")
+        )
+        let runner = PRDashboard(once: once, refreshInterval: refreshInterval, filter: filter)
         await runner.run()
+    }
+
+    /// Collect every occurrence of `--flag value` and `--flag=value`. Values may
+    /// also be comma-separated (e.g. `--exclude-org=zadr,foo`).
+    static func multiValue(args: [String], flag: String) -> [String] {
+        var values: [String] = []
+        var i = 0
+        while i < args.count {
+            let arg = args[i]
+            if arg == flag, i + 1 < args.count {
+                values.append(args[i + 1])
+                i += 2
+            } else if arg.hasPrefix(flag + "=") {
+                values.append(String(arg.dropFirst(flag.count + 1)))
+                i += 1
+            } else {
+                i += 1
+            }
+        }
+        return values.flatMap { $0.split(separator: ",").map { String($0).trimmingCharacters(in: .whitespaces) } }
+                     .filter { !$0.isEmpty }
+    }
+
+    static func singleValue(args: [String], flag: String) -> String? {
+        multiValue(args: args, flag: flag).last
+    }
+}
+
+struct RepoFilter: Sendable {
+    let includeOrgs: [String]
+    let excludeOrgs: [String]
+    let includeRepos: [String]
+    let excludeRepos: [String]
+
+    var isEmpty: Bool {
+        includeOrgs.isEmpty && excludeOrgs.isEmpty && includeRepos.isEmpty && excludeRepos.isEmpty
+    }
+
+    /// `nameWithOwner` is "org/repo". Returns true if it passes every filter.
+    func allows(_ nameWithOwner: String) -> Bool {
+        if isEmpty { return true }
+        let parts = nameWithOwner.split(separator: "/", maxSplits: 1).map(String.init)
+        guard parts.count == 2 else { return true }
+        let org = parts[0]
+        let repo = parts[1]
+
+        if !includeOrgs.isEmpty, !includeOrgs.contains(where: { Self.glob($0, org) }) { return false }
+        if excludeOrgs.contains(where: { Self.glob($0, org) }) { return false }
+        if !includeRepos.isEmpty, !includeRepos.contains(where: { Self.glob($0, repo) }) { return false }
+        if excludeRepos.contains(where: { Self.glob($0, repo) }) { return false }
+        return true
+    }
+
+    private static func glob(_ pattern: String, _ string: String) -> Bool {
+        // NSPredicate LIKE supports `*` (any chars) and `?` (one char).
+        // `[c]` is case-insensitive; GitHub orgs/repos are case-insensitive.
+        NSPredicate(format: "SELF LIKE[c] %@", pattern).evaluate(with: string)
     }
 }
 
@@ -57,12 +119,14 @@ enum PRCategory: CaseIterable {
 actor PRDashboard {
     let once: Bool
     let refreshInterval: Int
+    let filter: RepoFilter
     private var lastPRs: [PullRequest]?
     private var lastReviews: [ReviewRequest]?
 
-    init(once: Bool = false, refreshInterval: Int = 900) {
+    init(once: Bool = false, refreshInterval: Int = 900, filter: RepoFilter = RepoFilter(includeOrgs: [], excludeOrgs: [], includeRepos: [], excludeRepos: [])) {
         self.once = once
         self.refreshInterval = refreshInterval
+        self.filter = filter
     }
 
     func run() async {
@@ -72,9 +136,11 @@ actor PRDashboard {
             if let prs = await fetchAllPRs() { lastPRs = prs }
             if let reviews = await fetchReviewRequests() { lastReviews = reviews }
 
-            let grouped = categorize(lastPRs ?? [])
+            let prs = (lastPRs ?? []).filter { filter.allows($0.repo) }
+            let reviews = (lastReviews ?? []).filter { filter.allows($0.repo) }
+            let grouped = categorize(prs)
             if !once { clearScreen() }
-            render(grouped, reviews: lastReviews ?? [], error: lastError)
+            render(grouped, reviews: reviews, error: lastError)
             if once { return }
             try? await Task.sleep(for: .seconds(refreshInterval))
         } while true

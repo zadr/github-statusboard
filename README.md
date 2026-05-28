@@ -45,4 +45,27 @@ statusboard --once       # print once and exit
 statusboard --refresh-interval 1800  # refresh every 30 minutes
 ```
 
+### Filtering
+
+Limit which orgs and repos appear. All four flags may be repeated, accept
+comma-separated lists, and accept glob patterns (`*`, `?`, `[abc]`). Matching
+is case-insensitive. Quote globs to keep your shell from expanding them.
+
+```
+--include-org=acme              # only PRs from orgs matching 'acme'
+--exclude-org=zadr              # hide PRs from orgs matching 'zadr'
+--include-repo='ios*'           # only repos whose name starts with 'ios'
+--exclude-repo='*-archive'      # hide repos whose name ends with '-archive'
+```
+
+For example, to show every org except `zadr`, and within those only repos
+starting with `ios`:
+
+```
+statusboard --exclude-org=zadr --include-repo='ios*'
+```
+
+Include filters are OR'd within a flag and AND'd across flags. Exclude filters
+always win over include filters.
+
 Requires [`gh`](https://cli.github.com/) authenticated via `gh auth login`.
