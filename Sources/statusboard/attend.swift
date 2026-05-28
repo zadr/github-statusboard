@@ -67,13 +67,13 @@ actor PRDashboard {
 
     func run() async {
         repeat {
-            if !once { clearScreen() }
             lastError = nil
 
             if let prs = await fetchAllPRs() { lastPRs = prs }
             if let reviews = await fetchReviewRequests() { lastReviews = reviews }
 
             let grouped = categorize(lastPRs ?? [])
+            if !once { clearScreen() }
             render(grouped, reviews: lastReviews ?? [], error: lastError)
             if once { return }
             try? await Task.sleep(for: .seconds(refreshInterval))
@@ -81,7 +81,10 @@ actor PRDashboard {
     }
 
     private func clearScreen() {
-        print("\u{1B}[2J\u{1B}[H", terminator: "")
+        // Move cursor home, clear screen, clear scrollback. Write directly to
+        // stdout and flush so the sequence is applied before render() output.
+        let seq = "\u{1B}[H\u{1B}[2J\u{1B}[3J"
+        FileHandle.standardOutput.write(Data(seq.utf8))
     }
 
     private static let prFields = """
